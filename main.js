@@ -1,16 +1,18 @@
 // OpenSpec: the changes and specs of the repo you're in, in the side panel. Read-only.
 // Follows the focused terminal. Click the filter, then type to filter, ↑ ↓ for the
 // entry, ← → for its document, shift+← → for Active, Specs and Archived. Works on
-// any machine Herdr reaches; see data.js. The corner button (or "openspec:expand")
-// opens it near full screen, where it was; Esc or the button again closes it.
+// any machine Herdr reaches; see data.js. The corner button (or "openspec-reader:expand")
+// opens it as a tab of its own, pinned to this repo and entry; the button there closes
+// the tab. Local repos are watched, so edits show at once; remote ones are polled.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Popover, TextView } from "gpui-base";
-import { closeOverlay, exec, focused, layout, nextCommand, openOverlay, panes, props, readTextFile, spaces, theme } from "herdr";
+import { exec, focused, layout, nextCommand, panes, props, readTextFile, run, spaces, theme, watchFolder } from "herdr";
 import { MISSING, diagramPaths, isDark, renderDiagram, splitMermaid } from "./mermaid.js";
 import { NO_OPENSPEC, SCAN, docsOf, matches, markdownSections, parseScan, parseSpecDoc, parseTasks, specOutline, titleOf } from "./data.js";
 
 const REFRESH_MS = 10000;
+const WATCHED_MS = 60000; // a watched repo rescans on its own: this is only a safety net
 // This copy stays alive while the panel is closed: looking costs nothing, the
 // scan only runs while the panel shows it.
 const TICK_MS = 500;
@@ -22,8 +24,7 @@ const BAR_W = 96;
 const LIST_ROWS = 4;
 const LIST_H = 260;
 const READ_W = 640; // a comfortable line length; wider panels centre the document
-const READ_W_FULL = 900; // expanded, there's room for longer lines
-const EXPANDED = { kind: "dialog", width: 0.94, height: 0.94 };
+const READ_W_FULL = 900; // in a tab of its own, there's room for longer lines
 const TABS = [
   { id: "active", label: "Active" },
   { id: "specs", label: "Specs" },
@@ -42,9 +43,14 @@ function find(node, id) {
   return null;
 }
 
-function visible() {
+// A tab copy: shown while the active space shows a tab holding an openspec pane.
+function visible(pinned) {
+  if (pinned) {
+    const tab = spaces().find((s) => s.active)?.tabs.find((t) => t.active);
+    return Boolean(tab && panes().some((p) => p.mod === "openspec-reader" && p.tab === tab.id));
+  }
   const panel = find(layout(), "panel");
-  return Boolean(panel && !panel.hidden && find(panel, "panel-body")?.active === "openspec");
+  return Boolean(panel && !panel.hidden && find(panel, "panel-body")?.active === "openspec-reader");
 }
 
 // The focused terminal's folder and machine, as the Files panel reads them.
@@ -78,10 +84,12 @@ export default class OpenSpec extends View {
     this.diagrams = new Map(); // png path -> { state: pending | ok | missing | error, ... }
     this.queue = []; // diagrams to render, one at a time: each starts a browser
     this.width = 0;
+    this.watching = new Set(); // local repo roots with a watch running
+    this.stale = false; // the watch saw a change: rescan when next shown
 
-    // Expanded: this copy is an overlay, opened by the panel's copy with where it was.
+    // A tab copy: opened by the panel's copy, pinned to where it was.
     const p = props() ?? {};
-    this.overlay = p.overlay ?? null;
+    this.pinned = p.pinned ?? null; // { folder, machine }
     this.entry = p.entry ?? null; // the entry to select once the scan lands
     if (p.tab) this.tab = p.tab;
     if (p.doc) this.doc = p.doc;
@@ -104,11 +112,11 @@ export default class OpenSpec extends View {
     });
   }
 
-  // While shown: rescan on arriving at another folder, else every so often.
+  // While shown: rescan on arriving at another folder, on a watched change, else every so often.
   tick(cx) {
     this.renderNext(cx);
-    if (!this.overlay && !visible()) return;
-    const { folder, machine } = location();
+    if (!visible(this.pinned)) return;
+    const { folder, machine } = this.pinned ?? location();
     if (folder !== this.folder || machine !== this.machine) {
       const place = (m, f) => JSON.stringify([m, f]);
       this.places.set(place(this.machine, this.folder), Object.fromEntries(PLACE.map((k) => [k, this[k]])));
@@ -122,12 +130,31 @@ export default class OpenSpec extends View {
       this.scanned = 0; // what it remembers shows now; this checks it's still right
       cx.notify();
     }
-    if (Date.now() - this.scanned >= REFRESH_MS) this.refresh(cx);
+    const every = this.watching.has(this.data?.root) && this.machine === null ? WATCHED_MS : REFRESH_MS;
+    if (this.stale || Date.now() - this.scanned >= every) this.refresh(cx);
+  }
+
+  // Local repos only: watchFolder can't reach other machines. One watch per root, kept
+  // for good; a change marks the view stale only while it shows that root.
+  watch(root, cx) {
+    if (this.machine !== null || !root || this.watching.has(root)) return;
+    this.watching.add(root);
+    cx.spawn(async () => {
+      try {
+        for (;;) {
+          await watchFolder(`${root}/openspec`);
+          if (root === this.data?.root && this.machine === null) this.stale = true;
+        }
+      } catch {
+        this.watching.delete(root); // can't arm: the poll covers it
+      }
+    });
   }
 
   refresh(cx) {
     if (this.busy) return;
     this.busy = true;
+    this.stale = false;
     this.scanned = Date.now();
     const { folder, machine } = this;
     cx.spawn(async (cx) => {
@@ -143,6 +170,7 @@ export default class OpenSpec extends View {
           const first = !this.data;
           this.data = parseScan(r.stdout);
           this.state = "ready";
+          this.watch(this.data.root, cx);
           if (first && !this.entry && !this.data.active.length && this.data.archived.length) this.tab = "archived";
           if (this.entry) {
             const at = this.shown().findIndex((item) => item.name === this.entry);
@@ -211,13 +239,18 @@ export default class OpenSpec extends View {
     this.picking = false;
   }
 
-  // The panel's copy opens an expanded one where it is; the expanded one closes itself.
+  // The panel's copy opens a tab pinned to where it is; the tab copy closes its tab.
   toggleExpanded() {
-    if (this.overlay) return void closeOverlay(this.overlay);
-    openOverlay({
-      ...EXPANDED,
-      mod: "openspec",
-      props: { tab: this.tab, entry: this.selected()?.name, doc: this.doc, filter: this.filter || undefined },
+    if (this.pinned) return void run("tab.close");
+    const entry = this.selected()?.name;
+    run("layout.hide", { id: "panel" }); // the tab takes over: don't show it twice
+    run("tab.new", {
+      name: entry ? titleOf(this.selected()).title : "OpenSpec",
+      mod: "openspec-reader",
+      props: {
+        pinned: { folder: this.folder, machine: this.machine },
+        tab: this.tab, entry, doc: this.doc, filter: this.filter || undefined,
+      },
     });
   }
 
@@ -228,7 +261,7 @@ export default class OpenSpec extends View {
         this.toggleExpanded();
         cx.notify();
       })
-      .child(svg(`mods/openspec/${this.overlay ? "minimize" : "maximize"}.svg`).size(14).text_color(t.muted));
+      .child(svg(`mods/openspec-reader/${this.pinned ? "minimize" : "maximize"}.svg`).size(14).text_color(t.muted));
   }
 
   renderNext(cx) {
@@ -275,7 +308,7 @@ export default class OpenSpec extends View {
         .child(TextView.markdown(`${id}-src`, "```mermaid\n" + source + "\n```").selectable(true).w_full().text_size(13).text_color(t.foreground));
     }
     // Shrunk to the column, never grown; a click opens it full size.
-    const column = Math.min(this.overlay ? READ_W_FULL : READ_W, (this.width || READ_W) - 56) - inset;
+    const column = Math.min(this.pinned ? READ_W_FULL : READ_W, (this.width || READ_W) - 56) - inset;
     const w = Math.max(80, Math.min(d.width, column));
     return div().id(id).flex_none().cursor_pointer()
       .on_click(() => void exec("open", [d.abs]).catch(() => {}))
@@ -562,7 +595,7 @@ export default class OpenSpec extends View {
         .when(deltas.length > 0, (row) => row.child(this.specsTab(t, deltas, doc)))))
       .when(outline.length > 1, (el) => el.child(this.sectionPicker(t, outline.map((o) => o.title), only)))
       .child(v_flex().id(`os-doc-${only ?? "all"}`).flex_1().min_h(0).items_center().overflow_y_scrollbar().px(12).py(6)
-        .child(v_flex().w_full().max_w(this.overlay ? READ_W_FULL : READ_W).child(text === undefined
+        .child(v_flex().w_full().max_w(this.pinned ? READ_W_FULL : READ_W).child(text === undefined
           ? div().text_size(12.5).text_color(t.dim).child("Loading…")
           : text === null
             ? div().text_size(12.5).text_color(t.dim).child(`Couldn't read ${doc.path}`)

@@ -1,8 +1,9 @@
 // Mermaid blocks in the documents, drawn as pictures. Herdr's markdown shows them as code,
 // so mermaid-cli (mmdc) renders each one to a PNG on this machine (the text may come from
 // another one) into .cache/, named by its source and theme. Any diagram type mmdc knows.
-// Needs `mmdc` on PATH: npm i -g @mermaid-js/mermaid-cli (PUPPETEER_SKIP_DOWNLOAD=1 is fine
-// with Google Chrome installed: puppeteer.json points mmdc at it).
+// Needs `mmdc` on PATH: npm i -g @mermaid-js/mermaid-cli. With Chrome or Chromium installed,
+// PUPPETEER_SKIP_DOWNLOAD=1 is fine: the render finds the browser and points mmdc at it
+// ($PUPPETEER_EXECUTABLE_PATH wins). With neither, mmdc uses puppeteer's own download.
 
 import { appHome, exec } from "herdr";
 
@@ -40,7 +41,7 @@ export function isDark(background) {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b < 128;
 }
 
-// $1 output png, $2 source, $3 theme, $4 puppeteer config, $5 scale. Prints its IHDR size bytes.
+// $1 output png, $2 source, $3 theme, $4 scale. Prints its IHDR size bytes.
 const RENDER = String.raw`
 out="$1"
 if [ ! -s "$out" ]; then
@@ -49,14 +50,24 @@ if [ ! -s "$out" ]; then
   mkdir -p "$(dirname "$out")" || exit 1
   in="$out.$$.mmd"; tmp="$out.$$.png"
   printf '%s\n' "$2" > "$in"
-  chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-  if [ -x "$chrome" ]; then
-    mmdc -q -i "$in" -o "$tmp" -t "$3" -b transparent -s "$5" -p "$4" >&2
+  cfg=; chrome=$PUPPETEER_EXECUTABLE_PATH
+  if [ -z "$chrome" ]; then
+    for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+             "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+             google-chrome google-chrome-stable chromium chromium-browser; do
+      case $c in /*) ;; *) c=$(command -v "$c" 2>/dev/null) || continue ;; esac
+      [ -x "$c" ] && { chrome=$c; break; }
+    done
+  fi
+  if [ -n "$chrome" ]; then
+    cfg="$out.$$.json"
+    printf '{"executablePath":"%s","headless":"shell"}\n' "$chrome" > "$cfg"
+    mmdc -q -i "$in" -o "$tmp" -t "$3" -b transparent -s "$4" -p "$cfg" >&2
   else
-    mmdc -q -i "$in" -o "$tmp" -t "$3" -b transparent -s "$5" >&2
+    mmdc -q -i "$in" -o "$tmp" -t "$3" -b transparent -s "$4" >&2
   fi
   rc=$?
-  rm -f "$in"
+  rm -f "$in" "$cfg"
   [ $rc -eq 0 ] && [ -s "$tmp" ] && mv "$tmp" "$out" || { rm -f "$tmp"; exit $(( rc ? rc : 1 )); }
 fi
 od -An -tu1 -j16 -N8 "$out"
@@ -65,15 +76,14 @@ od -An -tu1 -j16 -N8 "$out"
 // The PNG's place in Herdr's app folder (what image() takes) and on disk.
 export function diagramPaths(source, dark) {
   const name = `${hash(`${dark ? "dark" : "default"}\n${source}`)}.png`;
-  const rel = `mods/openspec/.cache/${name}`;
+  const rel = `mods/openspec-reader/.cache/${name}`;
   return { rel, abs: `${appHome()}/${rel}` };
 }
 
 // -> { rel, abs, width, height } at 1x; rejects with { code, message }.
 export async function renderDiagram(source, dark) {
   const { rel, abs } = diagramPaths(source, dark);
-  const config = `${appHome()}/mods/openspec/puppeteer.json`;
-  const r = await exec("sh", ["-c", RENDER, "sh", abs, source, dark ? "dark" : "default", config, String(SCALE)]);
+  const r = await exec("sh", ["-c", RENDER, "sh", abs, source, dark ? "dark" : "default", String(SCALE)]);
   if (r.code !== 0) {
     const message = r.code === MISSING ? "mmdc not found" : r.stderr.trim().split("\n").filter(Boolean).pop() || `mmdc exit ${r.code}`;
     throw { code: r.code, message };
