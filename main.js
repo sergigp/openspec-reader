@@ -1,11 +1,13 @@
 // OpenSpec: the changes and specs of the repo you're in, in the side panel. Read-only.
 // Follows the focused terminal. Click the filter, then type to filter, ↑ ↓ for the
 // entry, ← → for its document, shift+← → for Active, Specs and Archived. Works on
-// any machine Herdr reaches; see data.js.
+// any machine Herdr reaches; see data.js. The corner button (or "openspec:expand")
+// opens it near full screen, where it was; Esc or the button again closes it.
 
-import { View, div, svg } from "gpui-kit";
+import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Popover, TextView } from "gpui-base";
-import { exec, focused, layout, nextCommand, panes, readTextFile, spaces, theme } from "herdr";
+import { closeOverlay, exec, focused, layout, nextCommand, openOverlay, panes, props, readTextFile, spaces, theme } from "herdr";
+import { MISSING, diagramPaths, isDark, renderDiagram, splitMermaid } from "./mermaid.js";
 import { NO_OPENSPEC, SCAN, docsOf, matches, markdownSections, parseScan, parseSpecDoc, parseTasks, specOutline, titleOf } from "./data.js";
 
 const REFRESH_MS = 10000;
@@ -20,6 +22,8 @@ const BAR_W = 96;
 const LIST_ROWS = 4;
 const LIST_H = 260;
 const READ_W = 640; // a comfortable line length; wider panels centre the document
+const READ_W_FULL = 900; // expanded, there's room for longer lines
+const EXPANDED = { kind: "dialog", width: 0.94, height: 0.94 };
 const TABS = [
   { id: "active", label: "Active" },
   { id: "specs", label: "Specs" },
@@ -67,11 +71,23 @@ export default class OpenSpec extends View {
     this.scanned = 0;
     this.picking = false; // the dropdown is open
     this.sectioning = false; // the section dropdown is open
+    this.speccing = false; // the change's specs dropdown is open
     this.section = null; // the section shown alone, of the document this.sectionOf
     this.sectionOf = null;
     this.folds = new Map(); // task group -> folded by hand
+    this.diagrams = new Map(); // png path -> { state: pending | ok | missing | error, ... }
+    this.queue = []; // diagrams to render, one at a time: each starts a browser
+    this.width = 0;
 
-    this.input = InputState.new({ placeholder: "Type to filter…" });
+    // Expanded: this copy is an overlay, opened by the panel's copy with where it was.
+    const p = props() ?? {};
+    this.overlay = p.overlay ?? null;
+    this.entry = p.entry ?? null; // the entry to select once the scan lands
+    if (p.tab) this.tab = p.tab;
+    if (p.doc) this.doc = p.doc;
+    if (p.filter) this.filter = p.filter;
+
+    this.input = InputState.new({ placeholder: "Type to filter…", value: this.filter });
     this.input.on("change", (_e, cx) => {
       this.filter = this.input.value();
       this.at = 0;
@@ -90,7 +106,8 @@ export default class OpenSpec extends View {
 
   // While shown: rescan on arriving at another folder, else every so often.
   tick(cx) {
-    if (!visible()) return;
+    this.renderNext(cx);
+    if (!this.overlay && !visible()) return;
     const { folder, machine } = location();
     if (folder !== this.folder || machine !== this.machine) {
       const place = (m, f) => JSON.stringify([m, f]);
@@ -101,7 +118,7 @@ export default class OpenSpec extends View {
         data: null, state: "loading", error: "", tab: "active", at: 0, doc: "proposal",
         texts: new Map(), section: null, sectionOf: null,
       });
-      this.picking = this.sectioning = false;
+      this.picking = this.sectioning = this.speccing = false;
       this.scanned = 0; // what it remembers shows now; this checks it's still right
       cx.notify();
     }
@@ -126,7 +143,12 @@ export default class OpenSpec extends View {
           const first = !this.data;
           this.data = parseScan(r.stdout);
           this.state = "ready";
-          if (first && !this.data.active.length && this.data.archived.length) this.tab = "archived";
+          if (first && !this.entry && !this.data.active.length && this.data.archived.length) this.tab = "archived";
+          if (this.entry) {
+            const at = this.shown().findIndex((item) => item.name === this.entry);
+            if (at >= 0) this.at = at;
+            this.entry = null;
+          }
         }
       } catch (e) {
         if (moved()) return void (this.busy = false);
@@ -189,8 +211,80 @@ export default class OpenSpec extends View {
     this.picking = false;
   }
 
+  // The panel's copy opens an expanded one where it is; the expanded one closes itself.
+  toggleExpanded() {
+    if (this.overlay) return void closeOverlay(this.overlay);
+    openOverlay({
+      ...EXPANDED,
+      mod: "openspec",
+      props: { tab: this.tab, entry: this.selected()?.name, doc: this.doc, filter: this.filter || undefined },
+    });
+  }
+
+  expandButton(t) {
+    return div().id("os-expand").flex_none().p(4).rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        this.toggleExpanded();
+        cx.notify();
+      })
+      .child(svg(`mods/openspec/${this.overlay ? "minimize" : "maximize"}.svg`).size(14).text_color(t.muted));
+  }
+
+  renderNext(cx) {
+    if (this.rendering || !this.queue.length) return;
+    const { rel, source, dark } = this.queue.shift();
+    this.rendering = true;
+    cx.spawn(async (cx) => {
+      try {
+        this.diagrams.set(rel, { state: "ok", ...(await renderDiagram(source, dark)) });
+      } catch (e) {
+        this.diagrams.set(rel, { state: e?.code === MISSING ? "missing" : "error", error: e?.message ?? String(e) });
+      }
+      this.rendering = false;
+      this.renderNext(cx);
+      cx.notify();
+    });
+  }
+
+  // Markdown with its mermaid blocks drawn. `inset`: px the surroundings take from the column.
+  rich(t, id, text, { size = 15, color = t.foreground, inset = 0 } = {}) {
+    const md = (key, s) => TextView.markdown(key, s).selectable(true).w_full().text_size(size).text_color(color);
+    const parts = splitMermaid(text);
+    if (!parts.some((p) => p.mermaid !== undefined)) return md(id, text);
+    return v_flex().w_full().gap(10).children(parts.map((p, i) => p.mermaid !== undefined
+      ? this.diagram(t, `${id}-d${i}`, p.mermaid, inset)
+      : md(`${id}-${i}`, p.md)));
+  }
+
+  diagram(t, id, source, inset) {
+    const dark = isDark(t.background);
+    const { rel } = diagramPaths(source, dark);
+    let d = this.diagrams.get(rel);
+    if (!d) {
+      this.diagrams.set(rel, (d = { state: "pending" }));
+      this.queue.push({ rel, source, dark });
+    }
+    const box = () => v_flex().w_full().gap(6).p(10).rounded(7).bg(t.raised).border_1().border_color(t.border);
+    if (d.state === "pending") return box().child(div().text_size(12.5).text_color(t.dim).child("Rendering diagram…"));
+    if (d.state !== "ok") {
+      return box()
+        .child(div().text_size(12).text_color(t.muted).child(d.state === "missing"
+          ? "Install mermaid-cli to see this diagram: PUPPETEER_SKIP_DOWNLOAD=1 npm i -g @mermaid-js/mermaid-cli"
+          : `Couldn't draw this diagram: ${d.error}`))
+        .child(TextView.markdown(`${id}-src`, "```mermaid\n" + source + "\n```").selectable(true).w_full().text_size(13).text_color(t.foreground));
+    }
+    // Shrunk to the column, never grown; a click opens it full size.
+    const column = Math.min(this.overlay ? READ_W_FULL : READ_W, (this.width || READ_W) - 56) - inset;
+    const w = Math.max(80, Math.min(d.width, column));
+    return div().id(id).flex_none().cursor_pointer()
+      .on_click(() => void exec("open", [d.abs]).catch(() => {}))
+      .child(image(d.rel).w(w).h((d.height * w) / d.width));
+  }
+
   act(name, cx) {
-    if (name === "next") this.step(1);
+    if (name === "expand") this.toggleExpanded();
+    else if (name === "next") this.step(1);
     else if (name === "prev") this.step(-1);
     else if (name === "doc-next") this.stepDoc(1);
     else if (name === "doc-prev") this.stepDoc(-1);
@@ -271,7 +365,8 @@ export default class OpenSpec extends View {
   }
 
   // A button showing the choice, and a menu of `options`: { key, label, date?, chosen, pick }.
-  dropdown(t, { id, open, onOpen, label, hint, options }) {
+  // `trigger` replaces the full-width button, `anchor` the corner pinned to it.
+  dropdown(t, { id, open, onOpen, label, hint, options, trigger, anchor }) {
     const menu = v_flex().id(`${id}-options`).w(340).max_h(420).p(4).gap(1).rounded(8).overflow_y_scrollbar()
       .bg(t.popover).border_1().border_color(t.border).text_size(13)
       .children(options.map((o) => h_flex().id(`${id}-${o.key}`).flex_none().px(8).py(5).gap(8).items_center().rounded(6).cursor_pointer()
@@ -285,19 +380,47 @@ export default class OpenSpec extends View {
         })
         .child(div().flex_1().min_w(0).truncate().child(o.label))
         .when(Boolean(o.date), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(o.date)))));
-    const trigger = h_flex().id(`${id}-trigger`).h(32).w_full().px(10).gap(8).items_center().justify_between().rounded(7).cursor_pointer()
+    const button = trigger ?? h_flex().id(`${id}-trigger`).h(32).w_full().px(10).gap(8).items_center().justify_between().rounded(7).cursor_pointer()
       .border_1().border_color(t.border).hover((s) => s.bg(t.hover)).text_size(13).text_color(t.foreground)
       .child(div().flex_1().min_w(0).truncate().child(label))
       .when(Boolean(hint), (el) => el.child(div().flex_none().text_size(12).text_color(t.dim).child(hint)))
       .child(svg("mods/workspace-chrome/chevron-down.svg").size(12).flex_none().text_color(t.dim));
     return Popover.new(id)
+      .anchor(anchor ?? "top_left")
       .open(open)
       .on_open_change((value, cx) => {
         onOpen(value);
         cx.notify();
       })
-      .trigger(trigger)
+      .trigger(button)
       .content(menu);
+  }
+
+  // A change's spec deltas: one tab among its documents, however many there are.
+  specsTab(t, deltas, doc) {
+    const on = doc.delta === true;
+    return this.dropdown(t, {
+      id: "os-specs",
+      anchor: "top_right",
+      open: this.speccing,
+      onOpen: (value) => { this.speccing = value; },
+      options: deltas.map((d) => ({
+        key: d.id,
+        label: d.label,
+        chosen: d.id === doc.id,
+        pick: (cx) => {
+          this.doc = d.id;
+          this.loadDoc(cx);
+        },
+      })),
+      trigger: h_flex().id("os-specs-trigger").flex_none().px(9).py(4).gap(5).items_center().rounded(6).cursor_pointer().text_size(12)
+        .text_color(on ? t.foreground : t.muted)
+        .when(on, (el) => el.bg(t.selected).font_medium())
+        .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+        .child(div().max_w(200).truncate().child(on ? doc.label : "Specs"))
+        .when(!on, (el) => el.child(div().text_color(t.dim).child(String(deltas.length))))
+        .child(svg("mods/workspace-chrome/chevron-down.svg").size(10).flex_none().text_color(t.dim)),
+    });
   }
 
   // Long lists (Archived, Specs) go in a dropdown, so the document gets the room.
@@ -354,7 +477,7 @@ export default class OpenSpec extends View {
 
   tasksView(t, tasks, path, only) {
     const finished = tasks.done === tasks.total;
-    const md = (id, text, color = t.foreground, size = 14) => TextView.markdown(`${path}-${id}`, text).selectable(true).w_full().text_size(size).text_color(color);
+    const md = (id, text, color = t.foreground, size = 14) => this.rich(t, `${path}-${id}`, text, { size, color, inset: 60 });
     const task = (x, id) => h_flex().gap(8).items_start()
       .child(div().w(16).flex_none().pt(1).text_size(13).text_color(x.done ? t.ansi2 : t.muted).child(x.done ? "✓" : "○"))
       .when(Boolean(x.id), (el) => el.child(div().w(34).flex_none().pt(2).text_size(11.5).text_color(t.dim).child(x.id)))
@@ -391,7 +514,7 @@ export default class OpenSpec extends View {
   specView(t, spec, path, pick) {
     const OP = { ADDED: t.ansi2, MODIFIED: t.accent, REMOVED: t.ansi1, RENAMED: t.muted };
     const WORD = { WHEN: t.accent, THEN: t.ansi2 };
-    const md = (id, text, size = 15) => TextView.markdown(`${path}-${id}`, text).selectable(true).w_full().text_size(size).text_color(t.foreground);
+    const md = (id, text, size = 15) => this.rich(t, `${path}-${id}`, text, { size, inset: 50 });
     const pill = (op) => div().flex_none().px(6).py(1).rounded(4).border_1().border_color(OP[op]).text_size(11).font_medium().text_color(OP[op]).child(op);
     const scenario = (c, id) => v_flex().gap(6).p(10).rounded(7).bg(t.background).border_1().border_color(t.border)
       .child(div().text_size(14).font_medium().text_color(t.foreground).child(c.title))
@@ -432,16 +555,19 @@ export default class OpenSpec extends View {
     const value = parsed?.value;
     const outline = parsed?.outline ?? [];
     const only = this.sectionOf === doc.path && this.section < outline.length ? this.section : null;
+    const deltas = this.docs().filter((d) => d.delta), files = this.docs().filter((d) => !d.delta);
     return v_flex().flex_1().min_w(0).min_h(0).gap(8)
-      .when(this.docs().length > 1, (el) => el.child(h_flex().flex_none().gap(3).flex_wrap().children(this.docs().map((d) => this.docButton(t, d, d.id === doc.id)))))
+      .when(this.docs().length > 1 || deltas.length > 0, (el) => el.child(h_flex().flex_none().gap(3).flex_wrap()
+        .children(files.map((d) => this.docButton(t, d, d.id === doc.id)))
+        .when(deltas.length > 0, (row) => row.child(this.specsTab(t, deltas, doc)))))
       .when(outline.length > 1, (el) => el.child(this.sectionPicker(t, outline.map((o) => o.title), only)))
       .child(v_flex().id(`os-doc-${only ?? "all"}`).flex_1().min_h(0).items_center().overflow_y_scrollbar().px(12).py(6)
-        .child(v_flex().w_full().max_w(READ_W).child(text === undefined
+        .child(v_flex().w_full().max_w(this.overlay ? READ_W_FULL : READ_W).child(text === undefined
           ? div().text_size(12.5).text_color(t.dim).child("Loading…")
           : text === null
             ? div().text_size(12.5).text_color(t.dim).child(`Couldn't read ${doc.path}`)
             : value ? (doc.id === "tasks" ? this.tasksView(t, value, doc.path, only) : this.specView(t, value, doc.path, only === null ? null : outline[only]))
-            : TextView.markdown(`md-${doc.path}-${only ?? "all"}`, only === null ? withoutTitle(text) : outline[only].text).selectable(true).text_size(15).text_color(t.foreground))));
+            : this.rich(t, `md-${doc.path}-${only ?? "all"}`, only === null ? withoutTitle(text) : outline[only].text))));
   }
 
   note(t, text) {
@@ -472,6 +598,12 @@ export default class OpenSpec extends View {
     const where = [repo, this.machine].filter(Boolean).join(" · ");
     return v_flex().id("os-root").size_full().min_h(0).p(12).gap(10).rounded(10).overflow_hidden()
       .bg(t.background).border_1().border_color(t.border).text_size(13)
+      .on_size_change((size, cx) => {
+        if (Math.abs(size.width - this.width) > 20) {
+          this.width = size.width;
+          cx.notify();
+        }
+      })
       .on_key_down((e, cx) => {
         const k = e.keystroke;
         const name = k === "down" ? "next"
@@ -488,7 +620,8 @@ export default class OpenSpec extends View {
       })
       .child(h_flex().h(36).flex_none().px(12).gap(10).items_center().rounded(9).border_1().border_color(t.border).bg(t.background)
         .child(Input.new(this.input).flex_1().h_full().text_size(13).text_color(t.foreground))
-        .child(div().flex_none().text_size(12).text_color(t.muted).child(where)))
+        .child(div().flex_none().text_size(12).text_color(t.muted).child(where))
+        .child(this.expandButton(t)))
       .child(h_flex().flex_none().gap(4).children(TABS.map((tab) => this.tabButton(t, tab))))
       .child(this.body(t));
   }

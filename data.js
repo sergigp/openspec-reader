@@ -82,7 +82,7 @@ export function docsOf(item, root) {
   if (item.flags.includes("p")) docs.push({ id: "proposal", label: "Proposal", path: `${dir}/proposal.md` });
   if (item.flags.includes("d")) docs.push({ id: "design", label: "Design", path: `${dir}/design.md` });
   if (item.flags.includes("t")) docs.push({ id: "tasks", label: "Tasks", path: `${dir}/tasks.md` });
-  for (const delta of item.deltas) docs.push({ id: delta, label: specLabel(delta), path: `${dir}/${delta}` });
+  for (const delta of item.deltas) docs.push({ id: delta, label: specLabel(delta), path: `${dir}/${delta}`, delta: true });
   return docs;
 }
 
