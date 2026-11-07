@@ -48,11 +48,25 @@ Each diagram is rendered once, to `.cache/<hash>.png` in this folder. The hash c
 
 ## Install
 
-Copy this folder to `~/.config/herdr-app/mods/openspec-reader` and add it to a layout, for example as a side-panel tab:
-
-```json
-{ "id": "openspec-reader", "mod": "openspec-reader" }
+```sh
+git clone https://github.com/sergigp/openspec-reader ~/.config/herdr-app/mods/openspec-reader
+herdr-app check ~/.config/herdr-app/mods/openspec-reader
 ```
+
+It hot-loads; no restart. Update with `git pull` in that folder.
+
+Then show it somewhere:
+
+- **Beside a terminal:** `herdr-app do pane.split '{"direction":"right","mod":"openspec-reader"}'`
+- **In a layout**, e.g. as a side-panel tab (the block id must be `openspec-reader`, so the mod knows when the panel shows it):
+
+  ```json
+  { "id": "openspec-reader", "type": "block", "content": { "mod": "openspec-reader" } }
+  ```
+
+  Herdr's shipped layouts are read-only: clone `main` (`layout.clone`) and its `tabs` mod (`mod.clone`) to add a block and a button beside Files and Changes.
+
+Tested with Herdr 0.1.13.
 
 ## Files
 
@@ -61,3 +75,7 @@ Copy this folder to `~/.config/herdr-app/mods/openspec-reader` and add it to a l
 | `main.js` | the view |
 | `data.js` | the scan script and the parsers for tasks, specs and sections |
 | `mermaid.js` | finding mermaid blocks and rendering them with `mmdc` |
+
+## License
+
+[MIT](LICENSE)
